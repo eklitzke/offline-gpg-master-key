@@ -1,0 +1,316 @@
+#!/bin/bash
+#
+# Copyright (C) 2019  Evan Klitzke <evan@eklitzke.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# --------------------------------------------------------------------------
+#
+# This is a helper script to work with offline GPG master key. This code is
+# adapted from the bash code Damien Goutte-Gattat included in his article:
+# https://incenp.org/notes/2015/using-an-offline-gnupg-master-key.html
+
+# Disk label
+LABEL=""
+
+# Disk UUID
+UUID=""
+
+# The pathname to the file containing your private keys on the drive.
+DEFAULTKEYFILE=private-keys.asc
+KEYFILE=""
+
+# Identify the device file corresponding to your USB stick
+DEVICE=""
+
+# When force mode, don't confirm choices from the user
+FORCE=0
+
+# Whether the device is mounted.
+declare -i MOUNTED=0
+
+# Temporary location to load key files
+TMPGPGHOME=""
+
+# Print program usage
+usage() {
+  echo \
+"usage: $(basename "$0") [-h] [-f] [-d DEVICE] [-l LABEL] [-u UUID] [-k KEYFILE] -- GPGARGS...
+
+Overview of Using Offline GnuPG Master Keys
+===========================================
+
+This script is a modified form of the one written by Damien Goutte-Gattat in his
+excellent offline GnuPG master key guide which you can find at:
+
+ * https://incenp.org/notes/2015/using-an-offline-gnupg-master-key.html
+
+Damien's page has more useful information than can be included here, so if you
+have additional questions you should read the instructions in the link above.
+
+In general, you will almost always want to specify additional arguments to gpg2
+when invoking this script. You can pass additional arguments directly to the
+gpg2 command specifying them following the GNU option style \"--\" command
+separator. For example, suppose my GPG master key is 0x157EFCACBC648422, and I
+wish to add a new subkey. With an online master key I might do:
+
+  # Example of how editing a key normally works with gpg2
+  $ gpg2 --expert --edit-key 0x157EFCACBC648422
+
+With an offline master key this won't work, as the private key needed to sign
+the subkey isn't available. If I stored the offline master key on a disk with
+label \"SECURE_KEY_3Z\" I would instead use a command like:
+
+  # Like above, but using a master key stored on disk label SECURE_KEY_3Z
+  $ $(basename "$0") -l SECURE_KEY_3Z -- --expert --edit-key 0x157EFCACBC648422
+
+In this example $(basename "$0") will see the argument -l SECURE_KEY_3Z which it
+will use to locate the USB key by its disk label. The master key will be
+temporarily copied into a secure temporary directory that gpg2 can use, and the
+arguments following the -- separator will be passed to gpg2 along with the path
+to the secure temporary directory containing the master key. In this example the
+$(basename "$0") will ultimately invoke a command that looks something like
+this:
+
+  # Actual gpg2 command invoked by $(basename "$0")
+  $ gpg2 --homedir XXXXXX --keyring YYYYYY --expert --edit-key 0x157EFCACBC648422
+
+Then gpg2 shell commands like \"addkey\" can be used in the usual way to
+generate and sign new subkeys using the offline master key.
+
+Specifying The Master Key Storage Device
+----------------------------------------
+
+The offline master key would typically be stored on a USB key, and at least one
+of the options -d DEVICE, -l LABEL, or -u UUID is required to specify which
+device holds the key.
+
+If you already know the device mount point (e.g. /dev/sda1) then you can invoke
+this script using the -d DEVICE option. Otherwise you can use -l LABEL with the
+DOS disk label or -u UUID with the disk uuid.
+
+To find the disk label or uuid of a USB key, plug the device in and use the
+lsblk command:
+
+  $ lsblk -o name,label,uuid"
+}
+
+# Usage warning
+usage-warning() {
+  echo \
+"WARNING: $(basename "$0") was invoked without any gpg2 arguments, which is
+probably not what you wanted to do. To learn more about the expected program
+usage, run:
+
+  $ $(basename "$0") -h
+
+If you absolutely know what you're doing, use -f to suppress this check."
+}
+
+# Confirm a choice from the user.
+confirm-choice() {
+  # Skip if -f was used, or stdin is not a TTY.
+  if [[ "$FORCE" -eq 1 ]] || [[ ! -t 0 ]]; then
+    return
+  fi
+
+  local prompt="Would you like to continue?" choice
+  if [[ -n "$1" ]]; then prompt="$1"; fi
+  while :; do
+    printf "\\n%s [Y/n] " "$prompt"
+    read -r choice
+    case "$choice" in
+      y|Y|"") return;;  # affirmative
+      n|N) return 1;;   # negative
+      *) ;;             # return to top of loop
+    esac
+  done
+}
+
+while getopts ":d:fhk:l:u:x" opt; do
+  case $opt in
+    d) DEVICE="$OPTARG";;
+    f) FORCE=1;;
+    h) usage; exit 0;;
+    k) KEYFILE="$OPTARG";;
+    l) LABEL="$OPTARG";;
+    u) UUID="$OPTARG";;
+    x) set -x;;
+    \?) echo "Invalid option: -$OPTARG" >&2; exit 1;;
+  esac
+done
+shift "$((OPTIND-1))"
+
+# Warn the user if they continue without any gpg2 arguments.
+if [[ $# -eq 0 ]]; then
+  usage-warning >&2
+  if [[ "$FORCE" -eq 0 ]]; then exit 1; fi
+fi
+
+# Try to find a device by label/uuid if -d was not given in the command line.
+detect-device() {
+  if [[ -z "$DEVICE" ]]; then
+    if [[ -n "$UUID" ]]; then
+      DEVICE=$(findfs UUID="$UUID")
+    elif [[ -n "$LABEL" ]]; then
+      DEVICE=$(findfs LABEL="$LABEL")
+    else
+      echo "error: Must pass at least one of -d DEVICE, -l LABEL, -u UUID" >&2
+      echo
+      usage
+      exit 1
+    fi
+    if [[ -z "$DEVICE" ]]; then
+      echo "error: Failed to find device with label \"$LABEL\" or uuid \"$UUID\"" >&2
+      exit 1
+    fi
+    echo -n "Device found at $DEVICE. "
+  fi
+
+  # Make sure the above actually found a device.
+  if [[ ! -b "$DEVICE" ]]; then
+    echo "error: Found device $DEVICE, but it is not a block device" >&2
+    exit 1
+  fi
+}
+
+# Get the device mount point
+getmount() { lsblk -n -o mountpoint "$DEVICE"; }
+
+# Mount the device
+mount-device() {
+  # Mount the stick if necessary.
+  MOUNTPOINT=$(getmount)
+  if [[ -n "$MOUNTPOINT" ]]; then
+    echo "Device $DEVICE already mounted at $MOUNTPOINT"
+  else
+    echo -n "Attempting to mount $DEVICE... "
+    if ! udisksctl mount --block-device "$DEVICE" --options ro >/dev/null; then
+      echo
+      echo "error: failed to mount device $DEVICE" >&2
+      exit 1
+    fi
+    MOUNTPOINT=$(getmount)
+    echo " successfully mounted at $MOUNTPOINT"
+    echo
+  fi
+  MOUNTED=1
+}
+
+# Unmount the device
+unmount-device() {
+  if [[ "$MOUNTED" -eq 1 ]]; then
+    echo "Unmounting device $DEVICE from mount point $MOUNTPOINT"
+    udisksctl unmount --block-device "$DEVICE"
+    MOUNTED=0
+  fi
+}
+
+# Create a temporary GPG home directory
+create-tmp-gpg-home() {
+  TMPGPGHOME=$(mktemp -d -p "${XDG_RUNTIME_DIR}" gpg.XXXXXX)
+  chmod 700 "$TMPGPGHOME"
+  echo "Created temporary dir $TMPGPGHOME to store gpg data, this directory will"
+  echo "automatically be destroyed when this script exits."
+}
+
+# Function to clean everything up once we're done.
+cleanup() {
+  # Ensure the USB device is unmounted.
+  unmount-device
+
+  # Try to kill the gpg-agent process if it exists.
+  if [[ -S "${TMPGPGHOME}/S.gpg-agent" ]]; then
+    gpg-connect-agent --homedir "${TMPGPGHOME}" KILLAGENT /bye
+  fi
+
+  # Remove the temporary GPG directory
+  if [[ -n "${TMPGPGHOME}" ]] && [[ -d "${TMPGPGHOME}" ]]; then
+    rm -rf "${TMPGPGHOME}"
+  fi
+}
+
+# Import gpg keys from the device
+import-gpg-keys() {
+  if [[ -z "$KEYFILE" ]]; then
+    echo
+    echo "Using default key file \"$DEFAULTKEYFILE\" (use -k KEYFILE to override)."
+    KEYFILE="$DEFAULTKEYFILE"
+  fi
+
+  # Check that the keyfile actually exists
+  FULLKEYPATH="${MOUNTPOINT}/${KEYFILE}"
+  if [[ ! -f "$FULLKEYPATH" ]]; then
+    echo "Failed to find keyfile $KEYFILE at mount point $FULLKEYPATH" >&2
+    exit 1
+  fi
+
+  echo
+  echo "Importing keys from $FULLKEYPATH."
+  echo "You will be prompted for the passwords of any keys listed in this file"
+  echo "(possibly more than one if you have multiple keys in the file)."
+  confirm-choice "Continue importing keys?" || exit 1
+
+  # Import the offline private keys. Usually if this exits with an error then
+  # the private keys failed to import, and then we should probably just exit.
+  # However, this isn't always the case. For example, the secret key file may
+  # have had multiple keys listed in it, and if the user only imports one of
+  # those keys (e.g. because that's the one they plan to edit) then the gpg
+  # command will exit with an error, which would be OK in this situation.
+  if ! gpg2 -q --homedir "$TMPGPGHOME" --import "$FULLKEYPATH"; then
+    echo "error: There were some errors importing keys (this is usually bad)" >&2
+    confirm-choice "Continue even though some keys failed to import?" || exit 1
+  fi
+
+  # Unmount the stick immediately.
+  unmount-device
+}
+
+# Launch GnuPG from the temporary directory, with the default public keyring and
+# with any arguments given to us on the command line
+invoke-gpg-command() {
+  # Path to the keyring we will use.
+  KEYRING="${GNUPGHOME:-$HOME/.gnupg}/pubring.kbx"
+
+  # The gpg2 command we will invoke
+  GPGCMD=(gpg2 --homedir "$TMPGPGHOME" --keyring "$KEYRING" "$@")
+
+  echo \
+"
+About to invoke the following gpg2 command with master private keys as:
+
+  ${GPGCMD[*]}
+
+Use this gpg2 session as usual and then exit. After this command completes, the
+agent will be killed and the temporary homedir at $TMPGPGHOME will be
+destroyed."
+
+  confirm-choice "Run the gpg2 command listed above?" || exit 1
+
+  # Invoke the gpg command. Note that we cannot use "exec" here, as we want to
+  # make sure the script's EXIT trap runs after the gpg2 command completes.
+  "${GPGCMD[@]}"
+}
+
+# Detect and mount the USB key
+detect-device
+mount-device
+
+# Create a temporary GPG home, and make sure we clean it up at script exit
+create-tmp-gpg-home
+trap cleanup EXIT
+
+# Import private keys into the temporary gpg dir, and then run the gpg2 command
+import-gpg-keys
+invoke-gpg-command "$@"
