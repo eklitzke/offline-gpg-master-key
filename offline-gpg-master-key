@@ -280,11 +280,12 @@ import-gpg-keys() {
 # Launch GnuPG from the temporary directory, with the default public keyring and
 # with any arguments given to us on the command line
 invoke-gpg-command() {
-  # Path to the keyring we will use.
+  # Path to the keyring we will use. Typically this should be the "regular" GPG
+  # keyring, not the one in the temporary homedir.
   KEYRING="${GNUPGHOME:-$HOME/.gnupg}/pubring.kbx"
 
   # The gpg2 command we will invoke
-  GPGCMD=(gpg2 --homedir "$TMPGPGHOME" --keyring "$KEYRING" "$@")
+  GPGCMD=(gpg2 --homedir "$TMPGPGHOME" --no-default-keyring --keyring "$KEYRING" "$@")
 
   echo \
 "

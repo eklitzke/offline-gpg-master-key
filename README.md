@@ -20,9 +20,9 @@ policies on subkeys, as in the event of a lost or expired key a user can easily
 generate new trusted subkeys from their secure master key.
 
 The `offline-gpg-master-key` script here is written in Bash and uses various
-Linux-specific commands to examine and mount block devices. It's probably
-relatively easy to port to other Unixes though (pull requests to improve
-portability are welcome).
+Linux-specific commands to examine and mount block devices. I've tested this
+code using GnuPG 2.2.x, and it probably works with other versions as well. If
+you have any portability improvements to make, please send me a pull request.
 
 This code is adapted from a script listed in Damien Goutte-Gattat's article
 [Using an offline GnuPG master
